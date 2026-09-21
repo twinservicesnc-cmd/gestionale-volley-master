@@ -1,0 +1,14 @@
+streamlit>=1.42,<2
+pandas>=2.2,<3
+requests>=2.31,<3
+plotly>=5.24,<7
+reportlab>=4.2,<5
+Pillow>=10.4,<13
+openpyxl>=3.1,<4
+pypdf>=5,<7
+PyPDF2>=3,<4
+google-api-python-client>=2.150,<3
+google-auth>=2.35,<3
+google-auth-httplib2>=0.2,<1
+streamlit-drawable-canvas>=0.9.3,<1
+kaleido==0.2.1
