@@ -9189,6 +9189,103 @@ def _presenze_salva_registrazione(voce):
     return True, "Presenza registrata correttamente. Grazie!"
 
 
+def _presenze_collega_promo_agli_allenamenti(allenamenti_db, stagione, registrazioni=None):
+    """Collega le registrazioni QR Mini/Scuola alla seduta stagionale dello stesso giorno.
+
+    Le persone iscritte vengono registrate nella normale mappa presenze della seduta.
+    Le prove, che non possiedono ancora un id atleta, restano in un elenco separato
+    della stessa seduta e partecipano comunque ai riepiloghi e alle statistiche.
+    L'operazione e' idempotente e non sovrascrive correzioni manuali successive.
+    """
+    if not isinstance(allenamenti_db, dict):
+        return {"collegate": 0, "iscritte": 0, "prove": 0, "senza_seduta": 0, "modificato": False}
+    sedute = allenamenti_db.get(str(stagione), [])
+    if not isinstance(sedute, list):
+        return {"collegate": 0, "iscritte": 0, "prove": 0, "senza_seduta": 0, "modificato": False}
+    if registrazioni is None:
+        registrazioni = _presenze_rileggi_da_drive(FILE_PRESENZE_PROMO, [])
+    if not isinstance(registrazioni, list):
+        registrazioni = []
+
+    def _minuti_orario(valore):
+        m = re.search(r"(\d{1,2}):(\d{2})", str(valore or ""))
+        return int(m.group(1)) * 60 + int(m.group(2)) if m else 0
+
+    collegate = iscritte = prove = senza_seduta = 0
+    modificato = False
+    for registrazione in registrazioni:
+        if str(registrazione.get("stagione", "")) != str(stagione):
+            continue
+        gruppo_norm = _presenze_testo_normale(registrazione.get("gruppo", ""))
+        if gruppo_norm not in {"minivolley", "scuola"}:
+            continue
+        data_reg = str(registrazione.get("data", "")).strip()
+        if not data_reg and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(registrazione.get("data_iso", ""))):
+            try:
+                data_reg = datetime.strptime(str(registrazione.get("data_iso")), "%Y-%m-%d").strftime("%d/%m/%Y")
+            except ValueError:
+                data_reg = ""
+        candidate = [
+            seduta for seduta in sedute
+            if str(seduta.get("data", "")).strip() == data_reg
+            and _presenze_testo_normale(seduta.get("squadra", "")) == gruppo_norm
+        ]
+        if not candidate:
+            senza_seduta += 1
+            continue
+        minuto_reg = _minuti_orario(registrazione.get("ora", ""))
+        seduta = min(candidate, key=lambda x: abs(_minuti_orario(x.get("ora_inizio", "")) - minuto_reg))
+        tipo = str(registrazione.get("tipo", "PRESENTE")).strip().upper()
+        stato = {
+            "PRESENTE": "Presente", "RECUPERO": "Presente", "PROVA": "Presente",
+            "ASSENTE": "Assente", "GIUSTIFICATA": "Giustificata", "INFORTUNATA": "Infortunata",
+        }.get(tipo, "Presente")
+        atleta_id = str(registrazione.get("atleta_id", "")).strip()
+        registro_id = str(registrazione.get("id") or registrazione.get("chiave_unica") or uuid.uuid4().hex)
+        if atleta_id:
+            convocati = [str(x) for x in (seduta.get("convocati_ids", []) or [])]
+            if atleta_id not in convocati:
+                convocati.append(atleta_id)
+                seduta["convocati_ids"] = convocati
+                modificato = True
+            presenze_seduta = seduta.setdefault("presenze", {})
+            precedente = presenze_seduta.get(atleta_id, {})
+            precedente_stato = precedente.get("stato", "Da registrare") if isinstance(precedente, dict) else str(precedente or "Da registrare")
+            precedente_fonte = precedente.get("fonte", "") if isinstance(precedente, dict) else ""
+            if precedente_stato == "Da registrare" or precedente_fonte == "QR MINI/SCUOLA":
+                nuova_voce = dict(precedente) if isinstance(precedente, dict) else {}
+                nuova_voce.update({
+                    "stato": stato, "note": str(registrazione.get("note", "") or ""),
+                    "fonte": "QR MINI/SCUOLA", "registrazione_promo_id": registro_id,
+                    "ora_registrazione": registrazione.get("ora", ""),
+                })
+                if nuova_voce != precedente:
+                    presenze_seduta[atleta_id] = nuova_voce
+                    modificato = True
+            iscritte += 1
+        else:
+            esterni = seduta.setdefault("partecipanti_qr_esterni", {})
+            nuova_prova = {
+                "id": registro_id, "cognome": registrazione.get("cognome", ""),
+                "nome": registrazione.get("nome", ""), "data_nascita": registrazione.get("data_nascita", ""),
+                "tipo": tipo, "stato": stato, "ora": registrazione.get("ora", ""),
+                "fonte": registrazione.get("fonte", "QR STAGIONALE"),
+                "telefono": registrazione.get("telefono", ""),
+                "visita_medica": registrazione.get("visita_medica_prova", ""),
+                "data_prenotazione_visita": registrazione.get("data_prenotazione_visita", ""),
+                "note": registrazione.get("note", ""),
+            }
+            if esterni.get(registro_id) != nuova_prova:
+                esterni[registro_id] = nuova_prova
+                modificato = True
+            prove += 1
+        collegate += 1
+    return {
+        "collegate": collegate, "iscritte": iscritte, "prove": prove,
+        "senza_seduta": senza_seduta, "modificato": modificato,
+    }
+
+
 def mostra_qr_presenze(link, titolo, key, etichetta=None):
     link = str(link or "").strip()
     if not link.startswith(("http://", "https://")):
@@ -12334,9 +12431,20 @@ elif pagina_scelta == 'Area Tecnica':
         allen_map = {_all_label(x):x for x in reversed(allen_stagione_visibili)}
 
         with tab_pres:
-            if st.button('🔄 AGGIORNA PRESENZE QR SQUADRE', use_container_width=True, key='aggiorna_presenze_qr_squadre'):
+            if st.button('🔄 AGGIORNA PRESENZE QR — SQUADRE + MINI/SCUOLA', use_container_width=True, key='aggiorna_presenze_qr_squadre'):
                 allenamenti_aggiornati_qr = _presenze_rileggi_da_drive(FILE_ALLENAMENTI, {})
+                registrazioni_mini_scuola = _presenze_rileggi_da_drive(FILE_PRESENZE_PROMO, [])
+                esito_collegamento_qr = _presenze_collega_promo_agli_allenamenti(
+                    allenamenti_aggiornati_qr, stagione_selezionata, registrazioni_mini_scuola
+                )
+                if esito_collegamento_qr.get('modificato'):
+                    salva_json_sicuro(FILE_ALLENAMENTI, allenamenti_aggiornati_qr)
                 st.session_state['allenamenti_tecnici'] = allenamenti_aggiornati_qr
+                imposta_feedback(
+                    f"✅ Presenze QR aggiornate: {esito_collegamento_qr.get('iscritte',0)} iscritte e "
+                    f"{esito_collegamento_qr.get('prove',0)} prove collegate agli allenamenti.",
+                    'success'
+                )
                 st.rerun()
             if not allen_map:
                 st.info('Nessun allenamento registrato.')
@@ -12344,6 +12452,31 @@ elif pagina_scelta == 'Area Tecnica':
                 scelta_all = st.selectbox('Allenamento', list(allen_map), key='pres_all_sel')
                 rec = allen_map[scelta_all]
                 mese_bloccato_rec = _mese_presenze_bloccato(rec)
+                try:
+                    data_seduta_presenze = datetime.strptime(str(rec.get('data','')).strip(), '%d/%m/%Y').date()
+                except (ValueError, TypeError):
+                    data_seduta_presenze = None
+                seduta_futura_presenze = bool(
+                    data_seduta_presenze and data_seduta_presenze > ora_italiana().date()
+                )
+                ruolo_presenze_corrente = str(st.session_state.get('ruolo_corrente','')).strip().casefold()
+                username_presenze_corrente = str(st.session_state.get('username_corrente','')).strip().casefold()
+                amministratore_presenze = (
+                    username_presenze_corrente == 'admin'
+                    or ruolo_presenze_corrente in {'amministratore', 'responsabile'}
+                )
+                autorizza_presenze_future = False
+                if seduta_futura_presenze:
+                    st.info(
+                        '📅 Elenco convocabili — la seduta è futura e le presenze non sono ancora aperte.'
+                    )
+                    if amministratore_presenze:
+                        autorizza_presenze_future = st.checkbox(
+                            'Consenti eccezionalmente la registrazione anticipata delle presenze',
+                            value=False,
+                            key=f"abilita_presenze_future_{rec.get('id','')}",
+                        )
+                blocco_presenze_future = seduta_futura_presenze and not autorizza_presenze_future
                 if mese_bloccato_rec:
                     st.warning('🔒 Il mese di questa squadra è chiuso. Le presenze sono consultabili ma non modificabili.')
                 ids = [str(x) for x in (rec.get('convocati_ids',[]) or [])]
@@ -12410,9 +12543,18 @@ elif pagina_scelta == 'Area Tecnica':
                         note_a = pres_a.get('note','') if isinstance(pres_a,dict) else ''
                         righe.append({'ID':aid,'Atleta':f"{a.get('cognome','')} {a.get('nome','')}",'Gruppo':a.get('gruppo',''),'Stato':stato_a,'Note':note_a})
                     dfp=pd.DataFrame(righe)
-                    colonne_bloccate_presenze = ['ID','Atleta','Gruppo','Stato','Note'] if mese_bloccato_rec else ['ID','Atleta','Gruppo']
+                    colonne_bloccate_presenze = ['ID','Atleta','Gruppo','Stato','Note'] if (mese_bloccato_rec or blocco_presenze_future) else ['ID','Atleta','Gruppo']
                     edited=st.data_editor(dfp, hide_index=True, use_container_width=True, disabled=colonne_bloccate_presenze, column_config={'ID':None,'Stato':st.column_config.SelectboxColumn('Stato',options=['Da registrare','Presente','Assente','Giustificata','Infortunata'],required=True)}, key=f"pres_editor_{rec.get('id')}")
-                    if st.button('💾 SALVA PRESENZE', type='primary', use_container_width=True, disabled=mese_bloccato_rec, key=f"save_pres_{rec.get('id')}"):
+                    partecipanti_esterni_rec = rec.get('partecipanti_qr_esterni', {}) or {}
+                    if isinstance(partecipanti_esterni_rec, dict) and partecipanti_esterni_rec:
+                        st.markdown('##### 🌟 Partecipanti registrati dal QR — prove/non ancora iscritti')
+                        st.dataframe(pd.DataFrame([{
+                            'Atleta': f"{x.get('cognome','')} {x.get('nome','')}".strip(),
+                            'Tipo': x.get('tipo','PROVA'), 'Stato': x.get('stato','Presente'),
+                            'Ora': x.get('ora',''), 'Visita medica': x.get('visita_medica',''),
+                            'Prenotata il': x.get('data_prenotazione_visita',''), 'Note': x.get('note',''),
+                        } for x in partecipanti_esterni_rec.values()]), use_container_width=True, hide_index=True)
+                    if st.button('💾 SALVA PRESENZE', type='primary', use_container_width=True, disabled=(mese_bloccato_rec or blocco_presenze_future), key=f"save_pres_{rec.get('id')}"):
                         nuovo={}
                         for _,r in edited.iterrows():
                             aid_salvataggio = str(r['ID'])
@@ -12653,7 +12795,18 @@ elif pagina_scelta == 'Area Tecnica':
                     imposta_feedback(f'✅ Registrate o aggiornate {inserite_manual} presenze.', 'success'); st.rerun()
 
             if st.button('🔄 AGGIORNA ELENCO PRESENZE', type='secondary', use_container_width=True, key='aggiorna_elenco_presenze_qr'):
-                st.session_state['presenze_promozionale'] = _presenze_rileggi_da_drive(FILE_PRESENZE_PROMO, [])
+                presenze_promo_aggiornate = _presenze_rileggi_da_drive(FILE_PRESENZE_PROMO, [])
+                st.session_state['presenze_promozionale'] = presenze_promo_aggiornate
+                esito_promo_aggiornato = _presenze_collega_promo_agli_allenamenti(
+                    allen_db, stagione_selezionata, presenze_promo_aggiornate
+                )
+                if esito_promo_aggiornato.get('modificato'):
+                    salva_json_sicuro(FILE_ALLENAMENTI, allen_db)
+                imposta_feedback(
+                    f"✅ Elenco aggiornato: {esito_promo_aggiornato.get('iscritte',0)} iscritte e "
+                    f"{esito_promo_aggiornato.get('prove',0)} prove collegate agli allenamenti.",
+                    'success'
+                )
                 st.rerun()
             presenze_promo = carica_json(FILE_PRESENZE_PROMO, [])
             if not isinstance(presenze_promo, list):
@@ -13283,7 +13436,8 @@ elif pagina_scelta == 'Area Tecnica':
                         'Squadra': seduta_controllo.get('squadra',''), 'Dettaglio': 'Formato data non riconosciuto',
                     })
                 if data_controllo and data_controllo <= oggi_controlli and convocati_controllo:
-                    registrate_controllo = 0
+                    esterni_controllo = seduta_controllo.get('partecipanti_qr_esterni', {}) or {}
+                    registrate_controllo = len(esterni_controllo) if isinstance(esterni_controllo, dict) else 0
                     mancanti_controllo = []
                     for aid_controllo in convocati_controllo:
                         voce_controllo = presenze_controllo.get(aid_controllo, 'Da registrare')
@@ -13302,7 +13456,8 @@ elif pagina_scelta == 'Area Tecnica':
                         anomalie_controlli.append({
                             'Tipo': 'PRESENZE INCOMPLETE', 'Data': seduta_controllo.get('data',''),
                             'Squadra': seduta_controllo.get('squadra',''),
-                            'Dettaglio': f"{len(mancanti_controllo)} convocate ancora da registrare",
+                            'Dettaglio': f"{len(mancanti_controllo)} convocate ancora da registrare"
+                            + (f" · {len(esterni_controllo)} prove/esterne presenti" if isinstance(esterni_controllo, dict) and esterni_controllo else ""),
                         })
 
             tipi_controllo = [str(x.get('Tipo','')) for x in anomalie_controlli]
@@ -13346,7 +13501,9 @@ elif pagina_scelta == 'Area Tecnica':
                         pass
                 fd1, fd2 = st.columns(2)
                 data_stat_dal = fd1.date_input('Dal giorno', min(date_stat_valide) if date_stat_valide else ora_italiana().date(), key='stat_all_dal')
-                data_stat_al = fd2.date_input('Al giorno', max(date_stat_valide) if date_stat_valide else ora_italiana().date(), key='stat_all_al')
+                oggi_statistiche = ora_italiana().date()
+                data_stat_al_predefinita = min(max(date_stat_valide), oggi_statistiche) if date_stat_valide else oggi_statistiche
+                data_stat_al = fd2.date_input('Al giorno', data_stat_al_predefinita, key='stat_all_al')
                 def _data_stat_compresa(seduta):
                     try:
                         giorno_seduta = datetime.strptime(str(seduta.get('data','')), '%d/%m/%Y').date()
@@ -13395,6 +13552,23 @@ elif pagina_scelta == 'Area Tecnica':
                         elif stato == 'Assente': r['Assenti'] += 1
                         elif stato == 'Giustificata': r['Giustificate'] += 1
                         elif stato == 'Infortunata': r['Infortunate'] += 1
+                    partecipanti_esterni_stat = all_rec.get('partecipanti_qr_esterni', {}) or {}
+                    if isinstance(partecipanti_esterni_stat, dict):
+                        for id_esterno_stat, esterno_stat in partecipanti_esterni_stat.items():
+                            chiave_esterno_stat = f"qr_esterno:{id_esterno_stat}"
+                            stato_esterno_stat = str(esterno_stat.get('stato','Presente') or 'Presente')
+                            r_esterno = stat.setdefault(chiave_esterno_stat, {
+                                'Atleta': f"{esterno_stat.get('cognome','')} {esterno_stat.get('nome','')} (PROVA)".strip(),
+                                'Gruppo': all_rec.get('squadra',''), 'Convocazioni': 0, 'Registrate': 0,
+                                'Presenti': 0, 'Assenti': 0, 'Giustificate': 0, 'Infortunate': 0,
+                            })
+                            r_esterno['Convocazioni'] += 1
+                            if stato_esterno_stat in {'Presente','Assente','Giustificata','Infortunata'}:
+                                r_esterno['Registrate'] += 1
+                            if stato_esterno_stat == 'Presente': r_esterno['Presenti'] += 1
+                            elif stato_esterno_stat == 'Assente': r_esterno['Assenti'] += 1
+                            elif stato_esterno_stat == 'Giustificata': r_esterno['Giustificate'] += 1
+                            elif stato_esterno_stat == 'Infortunata': r_esterno['Infortunate'] += 1
 
                 rows_stat = []
                 for r in stat.values():
